@@ -1,0 +1,103 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222", "--user", "beacon", "--pass", "${NATS_PASSWORD:-beacon}"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  beacon-api-1:
+    build: .
+    command: ["api"]
+    environment: &beacon-env
+      NATS_URL: nats://nats:4222
+      NATS_USER: beacon
+      NATS_PASSWORD: ${NATS_PASSWORD:-beacon}
+      BEACON_TOKEN: ${BEACON_TOKEN:-local-development-token}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      BASE_URL: http://beacon-api-1:8080
+      LEADER_ELECTION: disabled
+      POD_NAMESPACE: default
+      APP_VERSION: dev
+      GIT_SHA: local
+    ports:
+      - "8081:8080"
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beacon-api-2:
+    build: .
+    command: ["api"]
+    environment:
+      <<: *beacon-env
+      POD_NAME: beacon-api-2
+      BASE_URL: http://beacon-api-2:8080
+    ports:
+      - "8082:8080"
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beacon-scheduler:
+    build: .
+    command: ["scheduler"]
+    environment:
+      <<: *beacon-env
+      POD_NAME: beacon-scheduler
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beacon-checker:
+    build: .
+    command: ["checker"]
+    environment:
+      <<: *beacon-env
+      POD_NAME: beacon-checker
+    depends_on:
+      nats:
+        condition: service_healthy
+    deploy:
+      replicas: 3
+    restart: unless-stopped
+
+  beacon-notifier:
+    build: .
+    command: ["notifier"]
+    environment:
+      <<: *beacon-env
+      POD_NAME: beacon-notifier
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beacon-digest:
+    build: .
+    command: ["digest"]
+    environment:
+      <<: *beacon-env
+      POD_NAME: beacon-digest
+      BASE_URL: http://beacon-api-1:8080
+    depends_on:
+      nats:
+        condition: service_healthy
+      beacon-api-1:
+        condition: service_started
+    profiles: ["digest"]
+
+volumes:
+  nats-data:

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Beacon status</title>
+  <style>
+    body{font:16px system-ui,sans-serif;max-width:960px;margin:3rem auto;padding:0 1rem;color:#17202a}
+    h1{margin-bottom:.25rem}.muted{color:#667085}table{border-collapse:collapse;width:100%;margin-top:2rem}
+    th,td{text-align:left;padding:.75rem;border-bottom:1px solid #e5e7eb}.up{color:#087443}.down{color:#b42318}
+    .unknown{color:#667085}code{word-break:break-all}
+    form{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.75rem;margin-top:2rem}
+    label{display:grid;gap:.25rem}input,select,button{font:inherit;padding:.5rem;border:1px solid #d0d5dd;border-radius:.35rem}
+    button{background:#175cd3;color:white;border:0;cursor:pointer}footer{margin-top:3rem}
+  </style>
+</head>
+<body>
+  <h1>Beacon</h1><p class="muted">Service health and synthetic checks</p>
+  <p id="summary">Loading status…</p>
+  <form id="add-check">
+    <label>Name<input name="name" required maxlength="200"></label>
+    <label>Type<select name="type"><option value="http">HTTP</option><option value="tcp">TCP</option><option value="dns">DNS</option></select></label>
+    <label>Target<input name="target" required placeholder="https://example.com/health"></label>
+    <label>Interval (seconds)<input name="interval_seconds" type="number" min="10" value="30"></label>
+    <label>Timeout (seconds)<input name="timeout_seconds" type="number" min="1" max="30" value="5"></label>
+    <label>Bearer token<input name="token" type="password" autocomplete="current-password"></label>
+    <button type="submit">Add check</button>
+  </form>
+  <p id="form-error" role="status"></p>
+  <table><thead><tr><th>Check</th><th>Status</th><th>Last result</th><th>Latency</th><th>Trend / last change</th></tr></thead><tbody id="checks"></tbody></table>
+  <footer class="muted" id="footer">Beacon status</footer>
+  <script>
+    const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    function sparkline(results) {
+      const points = [...(results || [])].reverse().map((result, index, all) => {
+        const x = all.length < 2 ? 50 : (index * 100) / (all.length - 1);
+        return `${x},${result.ok ? 4 : 20}`;
+      }).join(" ");
+      return points ? `<svg width="100" height="24" viewBox="0 0 100 24" aria-label="Recent probe results"><polyline fill="none" stroke="#175cd3" stroke-width="2" points="${points}"/></svg>` : "—";
+    }
+    function render(checks) {
+      document.querySelector("#checks").innerHTML = checks.map(item => {
+        const check = item.check || item, state = item.state || {};
+        return `<tr><td>${esc(check.name)}<br><code class="muted">${esc(check.target)}</code></td><td class="${esc(state.status || "unknown")}">${esc(state.status || "unknown")}</td><td>${esc(state.last_result?.ts || "No runs yet")}</td><td>${state.last_result ? `${esc(state.last_result.latency_ms)} ms` : "—"}</td><td>${sparkline(state.recent)}<br>${esc(state.last_change_at || "")}</td></tr>`;
+      }).join("");
+      const counts = checks.reduce((totals, item) => {
+        const status = item.state?.status || "unknown";
+        totals[status] = (totals[status] || 0) + 1;
+        return totals;
+      }, {});
+      document.querySelector("#summary").textContent = `${checks.length} checks · ${counts.up || 0} up · ${counts.down || 0} down · ${counts.unknown || 0} unknown`;
+    }
+    async function refresh() {
+      const response = await fetch("/api/v1/checks");
+      if (response.ok) render((await response.json()).checks);
+      const status = await fetch("/api/v1/status");
+      if (status.ok) {
+        const info = (await status.json()).metadata;
+        document.querySelector("#footer").textContent = `Pod ${info.pod_name} · ${info.version} · ${info.git_sha} · NATS: ${info.nats}`;
+      }
+    }
+    const form = document.querySelector("#add-check");
+    form.elements.token.value = sessionStorage.getItem("beacon-token") || "";
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      const values = Object.fromEntries(new FormData(form));
+      sessionStorage.setItem("beacon-token", values.token);
+      const payload = {
+        name: values.name, type: values.type, target: values.target,
+        interval_seconds: Number(values.interval_seconds), timeout_seconds: Number(values.timeout_seconds)
+      };
+      const response = await fetch("/api/v1/checks", {
+        method: "POST", headers: {"Content-Type": "application/json", "Authorization": `Bearer ${values.token}`},
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+      document.querySelector("#form-error").textContent = response.ok ? "Check created." : JSON.stringify(result.errors || result);
+      if (response.ok) { form.reset(); form.elements.token.value = sessionStorage.getItem("beacon-token"); refresh(); }
+    });
+    refresh();
+    const events = new EventSource("/api/v1/stream");
+    events.addEventListener("snapshot", event => render(JSON.parse(event.data).checks));
+    events.addEventListener("state_change", refresh);
+    events.addEventListener("result", refresh);
+  </script>
+</body>
+</html>
