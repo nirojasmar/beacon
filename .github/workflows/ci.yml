@@ -55,17 +55,54 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   promote:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      IMAGE_TAG: git-${{ github.sha }}
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: nirojasmar/beacon-argo-gitops
           ref: main
+          token: ${{ secrets.GITOPS_PAT }}
+
       - name: Promote the newly built image tag into the GitOps overlay
+        shell: bash
         run: |
-          sed -i "s/^    newTag:.*/    newTag: git-${{ github.sha }}/" overlays/oci/kustomization.yaml
-          git config --global --add url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}.github.com".insteadOf https://github.com/
-          git add overlays/oci/kustomization.yaml
-          git commit -m "chore: promote image tag to git-${{ github.sha }}"
-          git push
+          file="overlays/oci/kustomization.yaml"
+
+          if [[ ! -f "$file" ]]; then
+            echo "Manifest not found: $file" >&2
+            exit 1
+          fi
+
+          tag_count="$(grep -Ec '^[[:space:]]*newTag:' "$file" || true)"
+          if [[ "$tag_count" -ne 1 ]]; then
+            echo "Expected exactly one newTag field in $file; found $tag_count" >&2
+            exit 1
+          fi
+
+          sed -i -E \
+            "s/^([[:space:]]*newTag:[[:space:]]*).*/\1${IMAGE_TAG}/" \
+            "$file"
+
+          grep -qE \
+            "^[[:space:]]*newTag:[[:space:]]*${IMAGE_TAG}[[:space:]]*$" \
+            "$file"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$file"
+
+          if git diff --cached --quiet; then
+            echo "Image tag is already up to date."
+            exit 0
+          fi
+
+          git commit -m "chore: promote image tag to ${IMAGE_TAG}"
+          git push origin HEAD:main
