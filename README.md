@@ -23,6 +23,10 @@ curl -X POST http://localhost:8081/api/v1/checks \
 
 The API also supports listing/reading, replacing with `If-Match` revision checks, deleting, immediate runs, recent results, status summaries, and an SSE event stream at `/api/v1/stream`. `docker compose --profile digest run --rm beacon-digest` runs a one-off summary.
 
+Built-in unauthenticated targets are available at `/demo/ok`, `/demo/status/{code}`, `/demo/slow?ms=1500`, and `/demo/flaky?fail_percent=30`. The delay is limited to 30 seconds; status codes must be 200–599 and failure percentages 0–100. `/version` returns the configured version, Git SHA, and pod name. The API serves health, startup, readiness, version, and Prometheus metrics on both its HTTP and metrics listeners; the other long-running components expose them on the metrics listener. `STARTUP_DELAY_SECONDS` keeps `/startupz` at `503 {"status":"starting"}` until the first NATS connection succeeds.
+
+Prometheus metrics include probe counts/durations, scheduled jobs, checker backlog, state CAS retries, notifications and DLQ events, connected SSE clients, NATS connection state/reconnects, scheduler leadership, and Go/process collectors. API shutdown cancels active SSE request contexts so streams close before the server's graceful-shutdown deadline. The checker stops fetching on SIGTERM and gives already-fetched work up to 20 seconds to finish.
+
 ## Build and test
 
 Go 1.23 or newer:
@@ -43,4 +47,4 @@ Link-local IPs are refused by HTTP and TCP checks. Private addresses remain allo
 
 ## Current implementation boundary
 
-The application runtime and local Compose stack are implemented. Optional annotated-Service discovery, Kubernetes resource manifests/GitOps overlays, and the GHCR-to-GitOps image promotion workflow are not included in this application repository yet; the requirements document describes those deployment tasks.
+The application runtime, local Compose stack, and image promotion workflow are implemented. Optional annotated-Service discovery is not included. Kubernetes resource manifests and GitOps overlays are maintained in the companion `beacon-argo-gitops` repository.

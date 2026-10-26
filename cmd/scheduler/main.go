@@ -30,17 +30,22 @@ func Run() {
 		log.Fatalf("load config: %v", err)
 	}
 	log.Printf("component=scheduler config=%s", cfg.Log())
-	if cfg.StartupDelaySeconds > 0 {
-		time.Sleep(time.Duration(cfg.StartupDelaySeconds) * time.Second)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	status := obs.NewComponentStatus(cfg.FaultFailReadiness)
+	if err := obs.StartHealthServer(cfg.MetricsAddr, status, "scheduler", cfg.AppVersion, cfg.GitSHA, cfg.PodName); err != nil {
+		log.Fatalf("start health server: %v", err)
 	}
 	obs.StartFaults(cfg)
+	if !obs.WaitForStartupDelay(ctx, cfg.StartupDelaySeconds) {
+		return
+	}
 	client, err := store.NewClient(cfg.NATSURL, cfg.NATSUser, cfg.NATSPassword)
 	if err != nil {
 		log.Fatalf("connect NATS: %v", err)
 	}
 	defer client.Close()
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	status.MarkStarted(client)
 	if err := client.EnsureInfrastructure(ctx, cfg.CheckConcurrency); err != nil {
 		log.Fatalf("initialize JetStream: %v", err)
 	}
@@ -48,9 +53,7 @@ func Run() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := obs.StartHealthServer(cfg.MetricsAddr, client, cfg.FaultFailReadiness, "scheduler"); err != nil {
-		log.Fatalf("start health server: %v", err)
-	}
+	status.MarkReady()
 	if cfg.LeaderElection == "disabled" {
 		obs.SetSchedulerLeader(true)
 		runScheduler(ctx, cfg, client, checks)
@@ -160,6 +163,7 @@ func runScheduler(ctx context.Context, cfg *config.Config, client *store.Client,
 					log.Printf("enqueue check %s: %v", check.ID, err)
 					continue
 				}
+				obs.SchedulerJobsPublished.Inc()
 				lastSlot[check.ID] = slot
 				nextDue[check.ID] = now.Add(time.Duration(check.IntervalSeconds) * time.Second)
 			}

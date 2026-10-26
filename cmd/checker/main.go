@@ -33,17 +33,22 @@ func Run() {
 		log.Fatalf("load config: %v", err)
 	}
 	log.Printf("component=checker config=%s", cfg.Log())
-	if cfg.StartupDelaySeconds > 0 {
-		time.Sleep(time.Duration(cfg.StartupDelaySeconds) * time.Second)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	status := obs.NewComponentStatus(cfg.FaultFailReadiness)
+	if err := obs.StartHealthServer(cfg.MetricsAddr, status, "checker", cfg.AppVersion, cfg.GitSHA, cfg.PodName); err != nil {
+		log.Fatalf("start health server: %v", err)
 	}
 	obs.StartFaults(cfg)
+	if !obs.WaitForStartupDelay(ctx, cfg.StartupDelaySeconds) {
+		return
+	}
 	client, err := store.NewClient(cfg.NATSURL, cfg.NATSUser, cfg.NATSPassword)
 	if err != nil {
 		log.Fatalf("connect NATS: %v", err)
 	}
 	defer client.Close()
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	status.MarkStarted(client)
 	if err := client.EnsureInfrastructure(ctx, cfg.CheckConcurrency); err != nil {
 		log.Fatalf("initialize JetStream: %v", err)
 	}
@@ -59,31 +64,38 @@ func Run() {
 	if err != nil {
 		log.Fatalf("subscribe to jobs: %v", err)
 	}
+	status.MarkReady()
 	defer func() {
 		if err := subscription.Unsubscribe(); err != nil {
 			log.Printf("unsubscribe from jobs: %v", err)
 		}
 	}()
-	if err := obs.StartHealthServer(cfg.MetricsAddr, client, cfg.FaultFailReadiness, "checker"); err != nil {
-		log.Fatalf("start health server: %v", err)
-	}
-
-	for {
+	for ctx.Err() == nil {
 		messages, err := subscription.Fetch(cfg.CheckConcurrency, nats.MaxWait(time.Second))
 		if err != nil {
 			if errors.Is(err, nats.ErrTimeout) {
 				continue
 			}
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("fetch jobs: %v", err)
-			time.Sleep(time.Second)
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 			continue
 		}
+		workCtx, cancelWork := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
 		var workers sync.WaitGroup
 		for _, message := range messages {
 			workers.Add(1)
 			go func(message *nats.Msg) {
 				defer workers.Done()
-				if err := processJob(ctx, cfg, client, checks, states, message); err != nil {
+				if err := processJob(workCtx, cfg, client, checks, states, message); err != nil {
 					log.Printf("process job: %v", err)
 					if nakErr := message.NakWithDelay(time.Second); nakErr != nil {
 						log.Printf("negative-ack job: %v", nakErr)
@@ -92,6 +104,7 @@ func Run() {
 			}(message)
 		}
 		workers.Wait()
+		cancelWork()
 	}
 }
 
@@ -125,7 +138,9 @@ func processJob(ctx context.Context, cfg *config.Config, client *store.Client, c
 		return message.Ack()
 	}
 
+	started := time.Now()
 	result := probes.Run(ctx, &check, cfg)
+	obs.RegisterCheckRun(check.Type, result.OK, time.Since(started).Seconds())
 	result.RunID = current.RunID
 	resultBytes, err := json.Marshal(result)
 	if err != nil {
@@ -170,6 +185,7 @@ func processJob(ctx context.Context, cfg *config.Config, client *store.Client, c
 		if err != nil {
 			latest, getErr := states.Get(key)
 			if getErr == nil && (revision == 0 || latest.Revision() != revision) {
+				obs.StateCASRetries.Inc()
 				continue
 			}
 			return fmt.Errorf("update state: %w", err)

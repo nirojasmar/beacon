@@ -33,27 +33,30 @@ func Run() {
 		log.Fatalf("load config: %v", err)
 	}
 	log.Printf("component=notifier config=%s", cfg.Log())
-	if cfg.StartupDelaySeconds > 0 {
-		time.Sleep(time.Duration(cfg.StartupDelaySeconds) * time.Second)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	status := obs.NewComponentStatus(cfg.FaultFailReadiness)
+	if err := obs.StartHealthServer(cfg.MetricsAddr, status, "notifier", cfg.AppVersion, cfg.GitSHA, cfg.PodName); err != nil {
+		log.Fatalf("start health server: %v", err)
 	}
 	obs.StartFaults(cfg)
+	if !obs.WaitForStartupDelay(ctx, cfg.StartupDelaySeconds) {
+		return
+	}
 	client, err := store.NewClient(cfg.NATSURL, cfg.NATSUser, cfg.NATSPassword)
 	if err != nil {
 		log.Fatalf("connect NATS: %v", err)
 	}
 	defer client.Close()
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	status.MarkStarted(client)
 	if err := client.EnsureInfrastructure(ctx, cfg.CheckConcurrency); err != nil {
 		log.Fatalf("initialize JetStream: %v", err)
-	}
-	if err := obs.StartHealthServer(cfg.MetricsAddr, client, cfg.FaultFailReadiness, "notifier"); err != nil {
-		log.Fatalf("start health server: %v", err)
 	}
 	subscription, err := client.Stream().PullSubscribe("events.state_change", "notifier", nats.BindStream("EVENTS"))
 	if err != nil {
 		log.Fatalf("subscribe to state changes: %v", err)
 	}
+	status.MarkReady()
 	defer func() {
 		if err := subscription.Unsubscribe(); err != nil {
 			log.Printf("unsubscribe from events: %v", err)
@@ -87,15 +90,18 @@ func deliver(ctx context.Context, cfg *config.Config, client *store.Client, http
 		return fmt.Errorf("read delivery metadata: %w", err)
 	}
 	if err := postWebhook(ctx, httpClient, cfg.WebhookURL, cfg.WebhookSecret, message.Data); err != nil {
+		obs.NotificationsTotal.WithLabelValues("failure").Inc()
 		if metadata.NumDelivered >= 8 {
 			if publishErr := client.Publish(ctx, "events.dlq", fmt.Sprintf("dlq:%d", metadata.Sequence.Stream), message.Data); publishErr != nil {
 				_ = message.NakWithDelay(time.Minute)
 				return fmt.Errorf("post webhook: %v; copy event to DLQ: %w", err, publishErr)
 			}
+			obs.DLQTotal.Inc()
 			return message.Term()
 		}
 		return retry(message, metadata.NumDelivered, err)
 	}
+	obs.NotificationsTotal.WithLabelValues("success").Inc()
 	return message.Ack()
 }
 

@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -31,10 +33,11 @@ import (
 var web embed.FS
 
 type server struct {
-	cfg    *config.Config
-	client *store.Client
-	checks nats.KeyValue
-	states nats.KeyValue
+	cfg             *config.Config
+	client          *store.Client
+	checks          nats.KeyValue
+	states          nats.KeyValue
+	componentStatus *obs.ComponentStatus
 }
 
 func Run() {
@@ -46,40 +49,27 @@ func Run() {
 		log.Fatal("BEACON_TOKEN is required by the API")
 	}
 	log.Printf("component=api config=%s", cfg.Log())
-	if cfg.StartupDelaySeconds > 0 {
-		time.Sleep(time.Duration(cfg.StartupDelaySeconds) * time.Second)
-	}
 	obs.StartFaults(cfg)
 
-	client, err := store.NewClient(cfg.NATSURL, cfg.NATSUser, cfg.NATSPassword)
-	if err != nil {
-		log.Fatalf("connect NATS: %v", err)
-	}
-	defer client.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := client.EnsureInfrastructure(ctx, cfg.CheckConcurrency); err != nil {
-		log.Fatalf("initialize JetStream: %v", err)
-	}
-	checks, err := client.KV("checks")
-	if err != nil {
-		log.Fatal(err)
-	}
-	states, err := client.KV("state")
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := obs.StartHealthServer(cfg.MetricsAddr, client, cfg.FaultFailReadiness, "api"); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	status := obs.NewComponentStatus(cfg.FaultFailReadiness)
+	if err := obs.StartHealthServer(cfg.MetricsAddr, status, "api", cfg.AppVersion, cfg.GitSHA, cfg.PodName); err != nil {
 		log.Fatalf("start metrics server: %v", err)
 	}
 
-	s := &server{cfg: cfg, client: client, checks: checks, states: states}
+	s := &server{cfg: cfg, componentStatus: status}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.index)
 	mux.HandleFunc("GET /healthz", s.health)
-	mux.HandleFunc("GET /startupz", s.health)
+	mux.HandleFunc("GET /startupz", status.StartupHandler)
 	mux.HandleFunc("GET /readyz", s.ready)
-	mux.HandleFunc("GET /metrics", s.metrics)
+	mux.Handle("GET /metrics", obs.MetricsHandler(status, "api"))
+	mux.HandleFunc("GET /version", s.version)
+	mux.HandleFunc("GET /demo/ok", s.demoOK)
+	mux.HandleFunc("GET /demo/status/{code}", s.demoStatus)
+	mux.HandleFunc("GET /demo/slow", s.demoSlow)
+	mux.HandleFunc("GET /demo/flaky", s.demoFlaky)
 	mux.HandleFunc("GET /api/v1/checks", s.listChecks)
 	mux.HandleFunc("POST /api/v1/checks", s.createCheck)
 	mux.HandleFunc("GET /api/v1/checks/{id}", s.getCheck)
@@ -90,28 +80,81 @@ func Run() {
 	mux.HandleFunc("GET /api/v1/status", s.status)
 	mux.HandleFunc("GET /api/v1/stream", s.stream)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: requestLog(mux), ReadHeaderTimeout: 5 * time.Second}
+	shutdownContext, stopStreams := context.WithCancel(context.Background())
+	httpServer, stopStreams := newHTTPServer(cfg.HTTPAddr, requestLog(startupGate(status, mux)), shutdownContext, stopStreams)
 	serverErrors := make(chan error, 1)
 	go func() {
 		serverErrors <- httpServer.ListenAndServe()
 	}()
+	if !obs.WaitForStartupDelay(ctx, cfg.StartupDelaySeconds) {
+		shutdownAPI(httpServer, serverErrors, stopStreams)
+		return
+	}
+	client, err := store.NewClient(cfg.NATSURL, cfg.NATSUser, cfg.NATSPassword)
+	if err != nil {
+		log.Fatalf("connect NATS: %v", err)
+	}
+	defer client.Close()
+	status.MarkStarted(client)
+	initCtx, cancelInit := context.WithTimeout(ctx, 30*time.Second)
+	err = client.EnsureInfrastructure(initCtx, cfg.CheckConcurrency)
+	cancelInit()
+	if err != nil {
+		log.Fatalf("initialize JetStream: %v", err)
+	}
+	checks, err := client.KV("checks")
+	if err != nil {
+		log.Fatal(err)
+	}
+	states, err := client.KV("state")
+	if err != nil {
+		log.Fatal(err)
+	}
+	s.client, s.checks, s.states = client, checks, states
+	status.MarkReady()
 	select {
 	case err := <-serverErrors:
 		if err != nil && err != http.ErrServerClosed {
 			log.Fatalf("API server: %v", err)
 		}
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		defer cancel()
-		if err := httpServer.Shutdown(shutdownCtx); err != nil {
-			log.Printf("graceful API shutdown: %v", err)
-		}
-		if err := <-serverErrors; err != nil && err != http.ErrServerClosed {
-			log.Printf("API server shutdown: %v", err)
-		}
+		shutdownAPI(httpServer, serverErrors, stopStreams)
 	}
+}
+
+func newHTTPServer(address string, handler http.Handler, shutdownContext context.Context, stopStreams context.CancelFunc) (*http.Server, context.CancelFunc) {
+	server := &http.Server{
+		Addr: address, Handler: handler, ReadHeaderTimeout: 5 * time.Second,
+		BaseContext: func(net.Listener) context.Context { return shutdownContext },
+	}
+	server.RegisterOnShutdown(stopStreams)
+	return server, stopStreams
+}
+
+func shutdownAPI(server *http.Server, serverErrors <-chan error, stopStreams context.CancelFunc) {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("graceful API shutdown: %v", err)
+	}
+	stopStreams()
+	if err := <-serverErrors; err != nil && err != http.ErrServerClosed {
+		log.Printf("API server shutdown: %v", err)
+	}
+}
+
+func startupGate(status *obs.ComponentStatus, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz", "/startupz", "/readyz", "/metrics", "/version":
+		default:
+			if !status.ReadyState() {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "starting"})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *server) index(w http.ResponseWriter, r *http.Request) {
@@ -129,24 +172,65 @@ func (s *server) index(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	s.componentStatus.HealthHandler(w, nil)
 }
 
 func (s *server) ready(w http.ResponseWriter, _ *http.Request) {
-	if s.cfg.FaultFailReadiness {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"dependency": "readiness fault enabled"})
-		return
-	}
-	if err := s.client.Ready(); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"dependency": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	s.componentStatus.ReadyHandler(w, nil)
 }
 
-func (s *server) metrics(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	_, _ = fmt.Fprintf(w, "# HELP beacon_up Whether Beacon can reach NATS.\n# TYPE beacon_up gauge\nbeacon_up %d\n", boolInt(s.client.Connected()))
+func (s *server) demoOK(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *server) demoStatus(w http.ResponseWriter, r *http.Request) {
+	code, err := strconv.Atoi(r.PathValue("code"))
+	if err != nil || code < 200 || code > 599 {
+		writeError(w, http.StatusBadRequest, "status code must be between 200 and 599")
+		return
+	}
+	writeJSON(w, code, map[string]int{"status": code})
+}
+
+func (s *server) demoSlow(w http.ResponseWriter, r *http.Request) {
+	delayMS := 1500
+	if value := r.URL.Query().Get("ms"); value != "" {
+		var err error
+		delayMS, err = strconv.Atoi(value)
+		if err != nil || delayMS < 0 || delayMS > 30000 {
+			writeError(w, http.StatusBadRequest, "ms must be between 0 and 30000")
+			return
+		}
+	}
+	timer := time.NewTimer(time.Duration(delayMS) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-r.Context().Done():
+		return
+	case <-timer.C:
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}
+}
+
+func (s *server) demoFlaky(w http.ResponseWriter, r *http.Request) {
+	failPercent := 30
+	if value := r.URL.Query().Get("fail_percent"); value != "" {
+		var err error
+		failPercent, err = strconv.Atoi(value)
+		if err != nil || failPercent < 0 || failPercent > 100 {
+			writeError(w, http.StatusBadRequest, "fail_percent must be between 0 and 100")
+			return
+		}
+	}
+	if rand.Intn(100) < failPercent {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *server) version(w http.ResponseWriter, r *http.Request) {
+	s.componentStatus.VersionHandler(s.cfg.AppVersion, s.cfg.GitSHA, s.cfg.PodName)(w, r)
 }
 
 func (s *server) listChecks(w http.ResponseWriter, r *http.Request) {
@@ -159,6 +243,20 @@ func (s *server) listChecks(w http.ResponseWriter, r *http.Request) {
 }
 
 type createRequest struct {
+	Name             string       `json:"name"`
+	Type             string       `json:"type"`
+	Target           string       `json:"target"`
+	IntervalSeconds  int          `json:"interval_seconds"`
+	TimeoutSeconds   int          `json:"timeout_seconds"`
+	Expect           model.Expect `json:"expect"`
+	RecordType       string       `json:"record_type,omitempty"`
+	FailureThreshold int          `json:"failure_threshold"`
+	SuccessThreshold int          `json:"success_threshold"`
+	Enabled          *bool        `json:"enabled"`
+	Tags             []string     `json:"tags"`
+}
+
+type updateCheckRequest struct {
 	Name             string       `json:"name"`
 	Type             string       `json:"type"`
 	Target           string       `json:"target"`
@@ -260,15 +358,12 @@ func (s *server) updateCheck(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusPreconditionFailed, "check revision does not match")
 		return
 	}
-	var check model.Check
-	if err := decodeJSON(r, &check); err != nil {
+	var input updateCheckRequest
+	if err := decodeJSON(r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	check.ID = id
-	check.Source = old.Source
-	check.CreatedAt = old.CreatedAt
-	check.UpdatedAt = time.Now().UTC()
+	check := applyUpdateRequest(old, input, id, time.Now().UTC())
 	if check.Tags == nil {
 		check.Tags = []string{}
 	}
@@ -297,6 +392,21 @@ func (s *server) updateCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("ETag", fmt.Sprintf("\"%d\"", newRevision))
 	writeJSON(w, http.StatusOK, check)
+}
+
+func applyUpdateRequest(old *model.Check, input updateCheckRequest, id string, updatedAt time.Time) *model.Check {
+	enabled := old.Enabled
+	if input.Enabled != nil {
+		enabled = *input.Enabled
+	}
+	return &model.Check{
+		ID: id, Name: input.Name, Type: input.Type, Target: input.Target,
+		IntervalSeconds: input.IntervalSeconds, TimeoutSeconds: input.TimeoutSeconds,
+		Expect: input.Expect, RecordType: input.RecordType,
+		FailureThreshold: input.FailureThreshold, SuccessThreshold: input.SuccessThreshold,
+		Enabled: enabled, Tags: input.Tags, Source: old.Source,
+		CreatedAt: old.CreatedAt, UpdatedAt: updatedAt,
+	}
 }
 
 func (s *server) deleteCheck(w http.ResponseWriter, r *http.Request) {
@@ -399,6 +509,8 @@ func (s *server) stream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming is not supported", http.StatusInternalServerError)
 		return
 	}
+	obs.SSEClients.Inc()
+	defer obs.SSEClients.Dec()
 	eventMessages, subscription, err := s.client.Subscribe("events.state_change")
 	if err != nil {
 		http.Error(w, "event stream unavailable", http.StatusServiceUnavailable)

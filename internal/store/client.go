@@ -38,6 +38,13 @@ func (c *Client) Connected() bool {
 	return c != nil && c.conn != nil && c.conn.IsConnected()
 }
 
+func (c *Client) Reconnects() uint64 {
+	if c == nil || c.conn == nil {
+		return 0
+	}
+	return c.conn.Stats().Reconnects
+}
+
 func (c *Client) Close() {
 	if c != nil && c.conn != nil {
 		if err := c.conn.Drain(); err != nil {
