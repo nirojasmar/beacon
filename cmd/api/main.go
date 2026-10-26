@@ -736,10 +736,3 @@ func requestLog(next http.Handler) http.Handler {
 		log.Printf("method=%s path=%s duration=%s", r.Method, r.URL.Path, time.Since(start))
 	})
 }
-
-func boolInt(value bool) int {
-	if value {
-		return 1
-	}
-	return 0
-}
