@@ -53,3 +53,19 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  promote:
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: nirojasmar/beacon-argo-gitops
+          ref: main
+      - name: Promote the newly built image tag into the GitOps overlay
+        run: |
+          sed -i "s/^    newTag:.*/    newTag: git-${{ github.sha }}/" overlays/oci/kustomization.yaml
+          git config --global --add url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}.github.com".insteadOf https://github.com/
+          git add overlays/oci/kustomization.yaml
+          git commit -m "chore: promote image tag to git-${{ github.sha }}"
+          git push
